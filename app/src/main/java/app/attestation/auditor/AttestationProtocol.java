@@ -9,6 +9,8 @@ import android.content.SharedPreferences;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
 import android.os.Build;
+import android.os.Bundle;
+import android.os.SecurityStateManager;
 import android.os.UserManager;
 import android.provider.Settings;
 import android.security.keystore.KeyGenParameterSpec;
@@ -52,18 +54,18 @@ import java.security.cert.CertificateException;
 import java.security.cert.CertificateFactory;
 import java.security.cert.X509Certificate;
 import java.security.spec.ECGenParameterSpec;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Date;
 import java.util.Enumeration;
 import java.util.List;
 import java.util.Locale;
+import java.util.concurrent.TimeUnit;
 import java.util.zip.DataFormatException;
 import java.util.zip.Deflater;
 import java.util.zip.DeflaterOutputStream;
 import java.util.zip.Inflater;
-
-import javax.security.auth.x500.X500Principal;
 
 import app.attestation.auditor.attestation.AttestationApplicationId;
 import app.attestation.auditor.attestation.AttestationApplicationId.AttestationPackageInfo;
@@ -147,7 +149,7 @@ class AttestationProtocol {
     // byte[] compressedChain { [short encodedCertificateLength, byte[] encodedCertificate] }
     // byte[] fingerprint (length: FINGERPRINT_LENGTH)
     // int osEnforcedFlags
-    // short autoRebootMinutes (-1 for unknown)
+    // int autoRebootSeconds (-1 for unknown)
     // byte portSecurityMode (-1 for unknown)
     // byte userCount (-1 for unknown)
     // }
@@ -155,7 +157,7 @@ class AttestationProtocol {
     //
     // Protocol version changes:
     //
-    // 6: autoRebootMinutes added
+    // 6: autoRebootSeconds added
     // 6: portSecurityMode added
     // 6: userCount added
     //
@@ -197,7 +199,7 @@ class AttestationProtocol {
     // the outer signature and the rest of the chain for pinning the expected chain. It enforces
     // downgrade protection for the OS version/patch (bootloader/TEE enforced) and app version (OS
     // enforced) by keeping them updated.
-    private static final byte PROTOCOL_VERSION = 5;
+    private static final byte PROTOCOL_VERSION = 6;
     private static final byte PROTOCOL_VERSION_MINIMUM = 5;
     // can become longer in the future, but this is the minimum length
     static final byte CHALLENGE_MESSAGE_LENGTH = 1 + RANDOM_TOKEN_LENGTH * 2;
@@ -252,7 +254,12 @@ class AttestationProtocol {
     public record DeviceInfo(int name, int attestationVersion, int keymasterVersion,
             // API for detecting this was replaced in keymaster v3 but the new one isn't used yet
             boolean rollbackResistant,
-            boolean enforceStrongBox, int osName) {}
+            boolean enforceStrongBox, int osName) {
+
+        boolean hasPogoPins() {
+            return name == R.string.device_pixel_tablet;
+        }
+    }
 
     private static final boolean isStrongBoxSupported = ImmutableSet.of(
             "Pixel 3",
@@ -553,7 +560,12 @@ class AttestationProtocol {
 
     private record Verified(int device, String verifiedBootKey, byte[] verifiedBootHash,
             int osName, int osVersion, int osPatchLevel, int vendorPatchLevel, int bootPatchLevel,
-            int appVersion, int appVariant, int securityLevel, boolean attestKey) {}
+            int appVersion, int appVariant, int securityLevel, boolean attestKey) {
+
+        boolean hasPogoPins() {
+            return device == R.string.device_pixel_tablet;
+        }
+    }
 
     private static X509Certificate generateCertificate(final InputStream in)
             throws CertificateException {
@@ -939,10 +951,18 @@ class AttestationProtocol {
         }
     }
 
-    record VerificationResult(boolean strong, String teeEnforced, String osEnforced, String history) {}
+    record VerificationResult(boolean strong, String teeEnforced, String osEnforced, String history) {
+    }
 
     private static String toYesNoString(final Context context, final boolean value) {
         return value ? context.getString(R.string.yes) : context.getString(R.string.no);
+    }
+
+    record SecurityStateExt(int autoRebootSeconds, byte portSecurityMode, byte userCount) {
+        static int UNKNOWN_VALUE = -1;
+        static int INVALID_VALUE = -2;
+        static SecurityStateExt UNKNOWN = new SecurityStateExt(
+                UNKNOWN_VALUE, (byte) UNKNOWN_VALUE, (byte) UNKNOWN_VALUE);
     }
 
     private static VerificationResult verify(final Context context, final byte[] fingerprint,
@@ -951,7 +971,8 @@ class AttestationProtocol {
             final boolean accessibility, final boolean deviceAdmin,
             final boolean deviceAdminNonSystem, final boolean adbEnabled,
             final boolean addUsersWhenLocked, final boolean enrolledBiometrics,
-            final boolean oemUnlockAllowed, final boolean systemUser)
+            final boolean oemUnlockAllowed, final boolean systemUser,
+            SecurityStateExt securityStateExt)
             throws GeneralSecurityException {
         final String fingerprintHex = BaseEncoding.base16().encode(fingerprint);
         final byte[] currentFingerprint = getFingerprint(attestationCertificates[0]);
@@ -1127,6 +1148,103 @@ class AttestationProtocol {
         osEnforced.append(context.getString(R.string.system_user,
                 toYesNoString(context, systemUser)));
 
+        final int usbcPortSecurityModePrefix;
+        if (verified.hasPogoPins()) {
+            usbcPortSecurityModePrefix = R.string.usbc_port_and_pogo_pins;
+        } else {
+            usbcPortSecurityModePrefix = R.string.usbc_port_security_mode;
+        }
+
+        final int usbcPortSecurityModeOffRes;
+        if (verified.hasPogoPins()) {
+            usbcPortSecurityModeOffRes = R.string.usbc_port_and_pogo_pins_security_mode_off;
+        } else {
+            usbcPortSecurityModeOffRes = R.string.usbc_port_security_mode_off;
+        }
+
+        final byte usbcPortSecurityMode = securityStateExt.portSecurityMode();
+        final int usbcPortSecurityModeValueRes;
+        if (usbcPortSecurityMode == SecurityStateExt.UNKNOWN_VALUE) {
+            usbcPortSecurityModeValueRes = R.string.unknown_value;
+        } else if (usbcPortSecurityMode == SecurityStateExt.INVALID_VALUE) {
+            usbcPortSecurityModeValueRes = R.string.invalid_value;
+        } else {
+            usbcPortSecurityModeValueRes = switch (usbcPortSecurityMode) {
+                case 0 -> usbcPortSecurityModeOffRes;
+                case 1 -> R.string.usbc_port_security_mode_charging_only;
+                case 2 -> R.string.usbc_port_security_mode_charging_only_when_locked;
+                case 3 -> R.string.usbc_port_security_mode_charging_only_when_locked_afu;
+                case 4 -> R.string.usbc_port_security_mode_on;
+                default -> throw new IllegalArgumentException();
+            };
+        }
+        osEnforced.append(context.getString(usbcPortSecurityModePrefix,
+                context.getString(usbcPortSecurityModeValueRes)));
+
+        final int autoRebootSeconds = securityStateExt.autoRebootSeconds();
+        final String autoRebootValueString;
+        if (autoRebootSeconds == SecurityStateExt.UNKNOWN_VALUE) {
+            autoRebootValueString = context.getString(R.string.unknown_value);
+        } else if (autoRebootSeconds == SecurityStateExt.INVALID_VALUE) {
+            autoRebootValueString = context.getString(R.string.invalid_value);
+        } else {
+            final Duration duration = Duration.ofSeconds(autoRebootSeconds);
+            StringBuilder autoRebootValueStrBuilder = new StringBuilder();
+
+            long hoursDuration = duration.toHours();
+            if (hoursDuration > 1) {
+                autoRebootValueStrBuilder.append(
+                        context.getString(R.string.auto_reboot_hours_plural_value, hoursDuration));
+            } else if (hoursDuration == 1) {
+                autoRebootValueStrBuilder.append(
+                        context.getString(R.string.auto_reboot_hours_singular_value));
+            }
+
+            int minutesPart = duration.toMinutesPart();
+            if (minutesPart > 1) {
+                if (autoRebootValueStrBuilder.length() != 0) {
+                    autoRebootValueStrBuilder.append(", ");
+                }
+                autoRebootValueStrBuilder.append(
+                        context.getString(R.string.auto_reboot_minutes_plural_value, minutesPart));
+            } else if (minutesPart == 1) {
+                if (autoRebootValueStrBuilder.length() != 0) {
+                    autoRebootValueStrBuilder.append(", ");
+                }
+                autoRebootValueStrBuilder.append(
+                        context.getString(R.string.auto_reboot_minutes_singular_value));
+            }
+
+            int secondsPart = duration.toSecondsPart();
+            if (secondsPart > 1) {
+                if (autoRebootValueStrBuilder.length() != 0) {
+                    autoRebootValueStrBuilder.append(", ");
+                }
+                autoRebootValueStrBuilder.append(
+                        context.getString(R.string.auto_reboot_seconds_plural_value, secondsPart));
+            } else if (secondsPart == 1) {
+                if (autoRebootValueStrBuilder.length() != 0) {
+                    autoRebootValueStrBuilder.append(", ");
+                }
+                autoRebootValueStrBuilder.append(
+                        context.getString(R.string.auto_reboot_seconds_singular_value));
+            }
+
+            autoRebootValueString = autoRebootValueStrBuilder.toString();
+        }
+        osEnforced.append(context.getString(R.string.auto_reboot_timeout, autoRebootValueString));
+
+        final byte userCount = securityStateExt.userCount();
+        final String userCountValueString;
+        if (userCount == SecurityStateExt.UNKNOWN_VALUE) {
+            userCountValueString = context.getString(R.string.unknown_value);
+        } else if (userCount == SecurityStateExt.INVALID_VALUE) {
+            userCountValueString = context.getString(R.string.invalid_value);
+        } else {
+            userCountValueString = String.valueOf(securityStateExt.userCount());
+        }
+        osEnforced.append(context.getString(R.string.user_count, userCountValueString));
+
         return new VerificationResult(hasPersistentKey, teeEnforced.toString(), osEnforced.toString(), history.toString());
     }
 
@@ -1224,10 +1342,14 @@ class AttestationProtocol {
             throw new GeneralSecurityException("invalid device administrator state");
         }
 
+        final SecurityStateExt securityStateExt;
         if (version >= 6) {
-            final short autoRebootMinutes = deserializer.getShort();
+            final int autoRebootSeconds = deserializer.getInt();
             final byte portSecurityMode = deserializer.get();
             final byte userCount = deserializer.get();
+            securityStateExt = new SecurityStateExt(autoRebootSeconds, portSecurityMode, userCount);
+        } else {
+            securityStateExt = SecurityStateExt.UNKNOWN;
         }
 
         final int signatureLength = deserializer.remaining();
@@ -1240,10 +1362,12 @@ class AttestationProtocol {
         final byte[] challenge = Arrays.copyOfRange(challengeMessage, 1 + RANDOM_TOKEN_LENGTH, 1 + RANDOM_TOKEN_LENGTH * 2);
         return verify(context, fingerprint, challenge, deserializer.asReadOnlyBuffer(), signature,
                 certificates, userProfileSecure, accessibility, deviceAdmin, deviceAdminNonSystem,
-                adbEnabled, addUsersWhenLocked, enrolledBiometrics, oemUnlockAllowed, systemUser);
+                adbEnabled, addUsersWhenLocked, enrolledBiometrics, oemUnlockAllowed, systemUser,
+                securityStateExt);
     }
 
-    record AttestationResult(boolean pairing, byte[] serialized) {}
+    record AttestationResult(boolean pairing, byte[] serialized) {
+    }
 
     static KeyGenParameterSpec.Builder getKeyBuilder(final String alias, final int purposes,
             final boolean useStrongBox, final byte[] challenge, final boolean temporary) {
@@ -1433,6 +1557,35 @@ class AttestationProtocol {
             final UserManager userManager = context.getSystemService(UserManager.class);
             final boolean systemUser = userManager.isSystemUser();
 
+            final Bundle extraSecurityState;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM) {
+                SecurityStateManager securityStateManager =
+                        context.getSystemService(SecurityStateManager.class);
+
+                if (securityStateManager != null) {
+                    Bundle extraSecurityStateTmp = Bundle.EMPTY;
+                    try {
+                        Bundle globalSecurityState = securityStateManager.getGlobalSecurityState();
+                        String securityStateExtKey = "android.ext.SECURITY_STATE_EXT";
+                        extraSecurityStateTmp = globalSecurityState.getBundle(securityStateExtKey);
+                    } catch (SecurityException e) {
+                        Log.e(TAG, "", e);
+                        String message = e.getMessage();
+                        if (message == null || !message.startsWith("get package info")
+                                || !message.endsWith("requires "
+                                + "android.permission.INTERACT_ACROSS_USERS_FULL or "
+                                + "android.permission.INTERACT_ACROSS_USERS to access user 0.")) {
+                            throw new GeneralSecurityException(e);
+                        }
+                    }
+                    extraSecurityState = extraSecurityStateTmp != null ? extraSecurityStateTmp : Bundle.EMPTY;
+                } else {
+                    extraSecurityState = Bundle.EMPTY;
+                }
+            } else {
+                extraSecurityState = Bundle.EMPTY;
+            }
+
             // Serialization
 
             final ByteBuffer serializer = ByteBuffer.allocate(MAX_MESSAGE_SIZE);
@@ -1483,16 +1636,46 @@ class AttestationProtocol {
             if (systemUser) {
                 osEnforcedFlags |= OS_ENFORCED_FLAGS_SYSTEM_USER;
             }
+            if (extraSecurityState != Bundle.EMPTY) {
+            }
             serializer.putInt(osEnforcedFlags);
 
             if (version >= 6) {
-                final short autoRebootMinutes = 0;
-                serializer.putShort(autoRebootMinutes);
+                String autoRebootTimeoutKey = "android.ext.AUTO_REBOOT_TIMEOUT";
+                final int autoRebootMilliseconds =
+                        extraSecurityState.getInt(autoRebootTimeoutKey, SecurityStateExt.UNKNOWN_VALUE);
+                final int autoRebootSeconds;
+                if (autoRebootMilliseconds == SecurityStateExt.UNKNOWN_VALUE) {
+                    autoRebootSeconds = SecurityStateExt.UNKNOWN_VALUE;
+                } else if (autoRebootMilliseconds < TimeUnit.SECONDS.toMillis(20)) {
+                    autoRebootSeconds = SecurityStateExt.INVALID_VALUE;
+                } else {
+                    autoRebootSeconds = (int) (Math.ceil((double) autoRebootMilliseconds / TimeUnit.SECONDS.toMillis(1)));
+                }
+                serializer.putInt(autoRebootSeconds);
 
-                final byte portSecurityMode = 0;
+                String portSecurityModeKey = "android.ext.USB_PORT_SECURITY_MODE";
+                final int portSecurityModeRaw = extraSecurityState.getInt(portSecurityModeKey, SecurityStateExt.UNKNOWN_VALUE);
+                final byte portSecurityMode;
+                if (portSecurityModeRaw == SecurityStateExt.UNKNOWN_VALUE) {
+                    portSecurityMode = (byte) SecurityStateExt.UNKNOWN_VALUE;
+                } else if (portSecurityModeRaw > Byte.MAX_VALUE || portSecurityModeRaw < 0) {
+                    portSecurityMode = (byte) SecurityStateExt.INVALID_VALUE;
+                } else {
+                    portSecurityMode = (byte) portSecurityModeRaw;
+                }
                 serializer.put(portSecurityMode);
 
-                final byte userCount = 0;
+                String userCountKey = "android.ext.USER_COUNT";
+                final int userCountRaw = extraSecurityState.getInt(userCountKey, SecurityStateExt.UNKNOWN_VALUE);
+                final byte userCount;
+                if (userCountRaw == SecurityStateExt.UNKNOWN_VALUE) {
+                    userCount = (byte) SecurityStateExt.UNKNOWN_VALUE;
+                } else if (userCountRaw > Byte.MAX_VALUE || userCountRaw < 0) {
+                    userCount = (byte) SecurityStateExt.INVALID_VALUE;
+                } else {
+                    userCount = (byte) userCountRaw;
+                }
                 serializer.put(userCount);
             }
 
